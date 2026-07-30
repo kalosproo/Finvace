@@ -1,5 +1,30 @@
 import React, { useState, useEffect, useMemo } from "react";
-import { Plus, Trash2, TrendingUp, TrendingDown, X } from "lucide-react";
+import { initializeApp } from "firebase/app";
+import { getAnalytics, isSupported } from "firebase/analytics";
+import { getAuth, GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut } from "firebase/auth";
+import { doc, getFirestore, onSnapshot, serverTimestamp, setDoc } from "firebase/firestore";
+import { LogIn, LogOut, Plus, Trash2, TrendingUp, TrendingDown, X } from "lucide-react";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAwaV8adaZSHfXtgRvYWNlx1DZFgH4ywrk",
+  authDomain: "finvace.firebaseapp.com",
+  projectId: "finvace",
+  storageBucket: "finvace.firebasestorage.app",
+  messagingSenderId: "1054835049063",
+  appId: "1:1054835049063:web:1a9081ae52735cc2914ac2",
+  measurementId: "G-3EDYR3BEST",
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const googleProvider = new GoogleAuthProvider();
+
+if (typeof window !== "undefined") {
+  isSupported().then((supported) => {
+    if (supported) getAnalytics(app);
+  });
+}
 
 const ASSET_CLASSES = ["Equity", "Crypto", "Mutual Fund"];
 const CLASS_OPACITY = { Equity: 0.95, Crypto: 0.55, "Mutual Fund": 0.3 };
@@ -17,6 +42,18 @@ const fmt = (n) => {
   return (neg ? "-₹" : "₹") + v;
 };
 const fmtPct = (n) => (n >= 0 ? "+" : "") + n.toFixed(2) + "%";
+
+const localPortfolio = {
+  load() {
+    const holdings = JSON.parse(window.localStorage.getItem("finvace:holdings") || "[]");
+    const journal = JSON.parse(window.localStorage.getItem("finvace:journal") || JSON.stringify(SEED_JOURNAL));
+    return { holdings, journal };
+  },
+  save(holdings, journal) {
+    window.localStorage.setItem("finvace:holdings", JSON.stringify(holdings));
+    window.localStorage.setItem("finvace:journal", JSON.stringify(journal));
+  },
+};
 
 function Field({ label, children }) {
   return (
@@ -40,6 +77,8 @@ const inputStyle = {
 
 export default function PortfolioTracker() {
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [user, setUser] = useState(null);
   const [holdings, setHoldings] = useState([]);
   const [journal, setJournal] = useState([]);
   const [tab, setTab] = useState("holdings");
@@ -51,45 +90,71 @@ export default function PortfolioTracker() {
   const [jForm, setJForm] = useState({ date: new Date().toISOString().slice(0, 10), instrument: "", direction: "Long", pnl: "", outcome: "WIN", notes: "" });
 
   useEffect(() => {
-    let mounted = true;
-    (async () => {
-      let h = [];
-      let j = null;
-      try {
-        const res = await window.storage.get("holdings", false);
-        if (res && res.value) h = JSON.parse(res.value);
-      } catch (e) { /* nothing stored yet */ }
-      try {
-        const res = await window.storage.get("journal", false);
-        if (res && res.value) j = JSON.parse(res.value);
-      } catch (e) { /* nothing stored yet */ }
-      if (j === null) {
-        j = SEED_JOURNAL;
-        try { await window.storage.set("journal", JSON.stringify(j), false); } catch (e) { /* ignore */ }
-      }
-      if (mounted) {
-        setHoldings(h);
-        setJournal(j);
+    let stopPortfolioSync;
+    const stopAuthSync = onAuthStateChanged(auth, (account) => {
+      setUser(account);
+      setNotice("");
+      if (stopPortfolioSync) stopPortfolioSync();
+
+      if (!account) {
+        const saved = localPortfolio.load();
+        setHoldings(saved.holdings);
+        setJournal(saved.journal);
         setLoading(false);
+        return;
       }
-    })();
-    return () => { mounted = false; };
+
+      setLoading(true);
+      const portfolioRef = doc(db, "users", account.uid, "portfolio", "state");
+      stopPortfolioSync = onSnapshot(portfolioRef, async (snap) => {
+        if (!snap.exists()) {
+          await setDoc(portfolioRef, { holdings: [], journal: SEED_JOURNAL, updatedAt: serverTimestamp() });
+          return;
+        }
+        const data = snap.data();
+        setHoldings(Array.isArray(data.holdings) ? data.holdings : []);
+        setJournal(Array.isArray(data.journal) ? data.journal : SEED_JOURNAL);
+        setLoading(false);
+      }, () => {
+        setNotice("Couldn't sync with Firestore. Check your Firebase rules and project setup.");
+        setLoading(false);
+      });
+    });
+
+    return () => {
+      if (stopPortfolioSync) stopPortfolioSync();
+      stopAuthSync();
+    };
   }, []);
 
-  const persistHoldings = async (next) => {
-    setHoldings(next);
+  const savePortfolio = async (nextHoldings, nextJournal) => {
+    setHoldings(nextHoldings);
+    setJournal(nextJournal);
+    setSaving(true);
     try {
-      const result = await window.storage.set("holdings", JSON.stringify(next), false);
-      if (!result) setNotice("Couldn't save — try again.");
-    } catch (e) { setNotice("Couldn't save — try again."); }
+      if (user) {
+        await setDoc(doc(db, "users", user.uid, "portfolio", "state"), {
+          holdings: nextHoldings,
+          journal: nextJournal,
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+      } else {
+        localPortfolio.save(nextHoldings, nextJournal);
+      }
+      setNotice(user ? "Saved to Finvace cloud." : "Saved on this device. Sign in with Google to sync.");
+    } catch (e) {
+      setNotice("Couldn't save — try again.");
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const persistJournal = async (next) => {
-    setJournal(next);
+  const signInWithGoogle = async () => {
     try {
-      const result = await window.storage.set("journal", JSON.stringify(next), false);
-      if (!result) setNotice("Couldn't save — try again.");
-    } catch (e) { setNotice("Couldn't save — try again."); }
+      await signInWithPopup(auth, googleProvider);
+    } catch (e) {
+      setNotice("Google login failed. Enable Google provider in Firebase Authentication.");
+    }
   };
 
   const enriched = useMemo(() => holdings.map((h) => {
@@ -122,30 +187,28 @@ export default function PortfolioTracker() {
     const cur = parseFloat(hForm.currentPrice);
     if (!hForm.name.trim() || !qty || !avg || !cur) { setNotice("Fill in name, quantity, avg price and current price."); return; }
     const next = [...holdings, { id: uid(), assetClass: hForm.assetClass, name: hForm.name.trim(), ticker: hForm.ticker.trim().toUpperCase(), quantity: qty, avgPrice: avg, currentPrice: cur }];
-    persistHoldings(next);
+    savePortfolio(next, journal);
     setHForm({ assetClass: "Equity", name: "", ticker: "", quantity: "", avgPrice: "", currentPrice: "" });
     setAddingHolding(false);
-    setNotice("");
   };
 
-  const deleteHolding = (id) => persistHoldings(holdings.filter((h) => h.id !== id));
+  const deleteHolding = (id) => savePortfolio(holdings.filter((h) => h.id !== id), journal);
 
   const submitJournal = () => {
     const pnl = parseFloat(jForm.pnl);
     if (!jForm.instrument.trim() || isNaN(pnl)) { setNotice("Fill in instrument and P&L."); return; }
     const next = [{ id: uid(), date: jForm.date, instrument: jForm.instrument.trim().toUpperCase(), direction: jForm.direction, pnl, outcome: jForm.outcome, notes: jForm.notes.trim() }, ...journal];
-    persistJournal(next);
+    savePortfolio(holdings, next);
     setJForm({ date: new Date().toISOString().slice(0, 10), instrument: "", direction: "Long", pnl: "", outcome: "WIN", notes: "" });
     setAddingJournal(false);
-    setNotice("");
   };
 
-  const deleteJournal = (id) => persistJournal(journal.filter((j) => j.id !== id));
+  const deleteJournal = (id) => savePortfolio(holdings, journal.filter((j) => j.id !== id));
 
   if (loading) {
     return (
       <div style={{ background: "#0B0B0C", minHeight: "100vh" }} className="flex items-center justify-center">
-        <span style={{ color: "#6E6D67", fontFamily: "'DM Sans', sans-serif" }} className="text-sm">Loading your portfolio…</span>
+        <span style={{ color: "#6E6D67", fontFamily: "'DM Sans', sans-serif" }} className="text-sm">Loading Finvace…</span>
       </div>
     );
   }
@@ -168,12 +231,24 @@ export default function PortfolioTracker() {
       <div className="max-w-3xl mx-auto px-5 py-10 sm:px-8">
         {/* Header */}
         <div className="flex items-center justify-between mb-8">
-          <span className="text-xs uppercase tracking-widest" style={{ color: "#6E6D67", letterSpacing: "0.15em" }}>Portfolio</span>
-          <span className="text-xs pf-mono" style={{ color: "#6E6D67" }}>{new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}</span>
+          <span className="text-xs uppercase tracking-widest" style={{ color: "#6E6D67", letterSpacing: "0.15em" }}>Finvace</span>
+          <div className="flex items-center gap-3">
+            <span className="text-xs pf-mono hidden sm:inline" style={{ color: "#6E6D67" }}>{new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}</span>
+            {user ? (
+              <button onClick={() => signOut(auth)} className="flex items-center gap-2 text-xs px-3 py-2 rounded-full" style={{ border: "1px solid #2A2A2D", color: "#F2F1EC" }}>
+                <LogOut size={14} /> {user.displayName || "Sign out"}
+              </button>
+            ) : (
+              <button onClick={signInWithGoogle} className="flex items-center gap-2 text-xs px-3 py-2 rounded-full" style={{ background: "#F2F1EC", color: "#0B0B0C", fontWeight: 700 }}>
+                <LogIn size={14} /> Google login
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Hero */}
         <div className="mb-8">
+          <div className="text-sm mb-2" style={{ color: "#8C8B86" }}>{user ? "Cloud-synced portfolio dashboard" : "Track locally or sign in to sync with Firestore"}{saving ? " · saving…" : ""}</div>
           <div className="pf-display" style={{ fontSize: "44px", fontWeight: 500, lineHeight: 1.05 }}>{fmt(totalValue)}</div>
           <div className="flex items-center gap-2 mt-3">
             {totalPnl >= 0 ? <TrendingUp size={15} color="#8FAF8A" /> : <TrendingDown size={15} color="#C97B6B" />}
@@ -233,7 +308,7 @@ export default function PortfolioTracker() {
         {tab === "holdings" && (
           <div>
             {byClass.length === 0 && (
-              <div className="text-sm mb-6" style={{ color: "#6E6D67" }}>No holdings yet. Add your first one below — equities, crypto, or a mutual fund.</div>
+              <div className="text-sm mb-6" style={{ color: "#6E6D67" }}>No holdings yet. Add your first Finvace asset below — equities, crypto, or a mutual fund.</div>
             )}
             {byClass.map((g) => (
               <div key={g.assetClass} className="mb-8">
