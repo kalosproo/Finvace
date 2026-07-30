@@ -231,7 +231,10 @@ export default function PortfolioTracker() {
       <div className="max-w-3xl mx-auto px-5 py-10 sm:px-8">
         {/* Header */}
         <div className="flex items-center justify-between mb-8">
-          <span className="text-xs uppercase tracking-widest" style={{ color: "#6E6D67", letterSpacing: "0.15em" }}>Finvace</span>
+          <div className="flex items-center gap-3">
+            <img src="/logo.svg" alt="Finvace logo" className="h-9 w-9 rounded-xl" />
+            <span className="text-xs uppercase tracking-widest" style={{ color: "#6E6D67", letterSpacing: "0.15em" }}>Finvace</span>
+          </div>
           <div className="flex items-center gap-3">
             <span className="text-xs pf-mono hidden sm:inline" style={{ color: "#6E6D67" }}>{new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}</span>
             {user ? (

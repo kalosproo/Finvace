@@ -8,3 +8,9 @@ createRoot(document.getElementById("root")).render(
     <PortfolioTracker />
   </React.StrictMode>,
 );
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/service-worker.js");
+  });
+}
