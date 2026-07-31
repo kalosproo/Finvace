@@ -1,9 +1,9 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import { getAnalytics, isSupported } from "firebase/analytics";
 import { getAuth, GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut } from "firebase/auth";
 import { doc, getFirestore, onSnapshot, serverTimestamp, setDoc } from "firebase/firestore";
-import { LogIn, LogOut, Plus, RefreshCw, Search, Trash2, TrendingUp, TrendingDown, X } from "lucide-react";
+import { LogIn, LogOut, Plus, RefreshCw, Trash2, TrendingUp, TrendingDown, X } from "lucide-react";
 
 const firebaseConfig = {
   apiKey: "AIzaSyAwaV8adaZSHfXtgRvYWNlx1DZFgH4ywrk",
@@ -108,6 +108,7 @@ export default function PortfolioTracker() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [refreshingNAV, setRefreshingNAV] = useState(false);
+  const refreshPricesRef = useRef(async () => {});
   const [user, setUser] = useState(null);
   const [holdings, setHoldings] = useState([]);
   const [journal, setJournal] = useState([]);
@@ -120,6 +121,7 @@ export default function PortfolioTracker() {
   const [fundSearchResults, setFundSearchResults] = useState([]);
   const [fundSearchNotice, setFundSearchNotice] = useState("");
   const [searchingFunds, setSearchingFunds] = useState(false);
+  const [selectedFund, setSelectedFund] = useState(null);
 
   const [hForm, setHForm] = useState({ assetClass: "Equity", name: "", ticker: "", quantity: "", avgPrice: "", currentPrice: "" });
   const [jForm, setJForm] = useState({ date: new Date().toISOString().slice(0, 10), instrument: "", direction: "Long", pnl: "", outcome: "WIN", notes: "" });
@@ -216,10 +218,10 @@ export default function PortfolioTracker() {
   const winRate = totalTrades ? (wins / totalTrades) * 100 : 0;
   const journalPnl = journal.reduce((s, j) => s + Number(j.pnl), 0);
 
-  const refreshMutualFundPrices = async () => {
+  const refreshPrices = async ({ silent = false } = {}) => {
     const mutualFunds = holdings.filter((holding) => holding.assetClass === "Mutual Fund");
     if (mutualFunds.length === 0) {
-      setNotice("Add a mutual fund holding to refresh NAVs.");
+      if (!silent) setNotice("Add a mutual fund holding to refresh prices.");
       setNavErrors([]);
       return;
     }
@@ -250,24 +252,76 @@ export default function PortfolioTracker() {
     }
 
     setNavErrors(errors);
-    setNotice(`${navById.size} mutual fund NAV${navById.size === 1 ? "" : "s"} refreshed${errors.length ? ` · ${errors.length} issue${errors.length === 1 ? "" : "s"}` : ""}.`);
+    if (!silent || errors.length > 0) {
+      setNotice(`${navById.size} mutual fund NAV${navById.size === 1 ? "" : "s"} refreshed${errors.length ? ` · ${errors.length} issue${errors.length === 1 ? "" : "s"}` : ""}.`);
+    }
     setRefreshingNAV(false);
   };
 
-  const runFundSearch = async () => {
-    setSearchingFunds(true);
-    setFundSearchNotice("");
-    try {
-      const results = await searchMutualFunds(fundSearchQuery);
-      setFundSearchResults(results);
-      if (results.length === 0) setFundSearchNotice("No matching funds found.");
-    } catch (e) {
+  refreshPricesRef.current = refreshPrices;
+
+  useEffect(() => {
+    if (loading) return undefined;
+
+    refreshPricesRef.current({ silent: true });
+    const intervalId = window.setInterval(() => {
+      refreshPricesRef.current({ silent: true });
+    }, 5 * 60 * 1000);
+
+    return () => window.clearInterval(intervalId);
+  }, [loading]);
+
+  useEffect(() => {
+    if (hForm.assetClass !== "Mutual Fund" || selectedFund) return undefined;
+
+    const query = fundSearchQuery.trim();
+    if (query.length < 2) {
       setFundSearchResults([]);
-      setFundSearchNotice(e.message || "Fund search failed.");
-    } finally {
-      setSearchingFunds(false);
+      setFundSearchNotice("");
+      return undefined;
+    }
+
+    let cancelled = false;
+    const debounceId = window.setTimeout(async () => {
+      setSearchingFunds(true);
+      setFundSearchNotice("");
+      try {
+        const results = await searchMutualFunds(query);
+        if (cancelled) return;
+        setFundSearchResults(results);
+        if (results.length === 0) setFundSearchNotice("No matching funds found.");
+      } catch (e) {
+        if (cancelled) return;
+        setFundSearchResults([]);
+        setFundSearchNotice(e.message || "Fund search failed.");
+      } finally {
+        if (!cancelled) setSearchingFunds(false);
+      }
+    }, 400);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(debounceId);
+    };
+  }, [fundSearchQuery, hForm.assetClass, selectedFund]);
+
+  const selectMutualFund = async (fund) => {
+    const nextFund = { schemeCode: String(fund.schemeCode), schemeName: fund.schemeName };
+    setSelectedFund(nextFund);
+    setFundSearchQuery("");
+    setFundSearchResults([]);
+    setFundSearchNotice("");
+    setHForm((form) => ({ ...form, name: nextFund.schemeName, ticker: nextFund.schemeCode }));
+
+    try {
+      const nav = await fetchMutualFundNAV(nextFund.schemeCode);
+      setHForm((form) => ({ ...form, currentPrice: String(nav) }));
+    } catch (e) {
+      setFundSearchNotice(`${nextFund.schemeName}: ${e.message || "couldn't fetch latest NAV"}`);
     }
   };
+
+
 
   const submitHolding = () => {
     const qty = parseFloat(hForm.quantity);
@@ -278,6 +332,9 @@ export default function PortfolioTracker() {
     const next = [...holdings, { id: uid(), assetClass: hForm.assetClass, name: hForm.name.trim(), ticker, quantity: qty, avgPrice: avg, currentPrice: cur }];
     savePortfolio(next, journal);
     setHForm({ assetClass: "Equity", name: "", ticker: "", quantity: "", avgPrice: "", currentPrice: "" });
+    setSelectedFund(null);
+    setFundSearchQuery("");
+    setFundSearchResults([]);
     setAddingHolding(false);
   };
 
@@ -400,14 +457,14 @@ export default function PortfolioTracker() {
         {tab === "holdings" && (
           <div>
             <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
-              <div className="text-xs" style={{ color: "#6E6D67" }}>Mutual fund NAVs use mfapi.in live prices.</div>
+              <div className="text-xs" style={{ color: "#6E6D67" }}>Mutual fund NAVs auto-refresh from mfapi.in every 5 minutes.</div>
               <button
-                onClick={refreshMutualFundPrices}
+                onClick={() => refreshPrices()}
                 disabled={refreshingNAV}
                 className="flex items-center gap-2 text-sm px-3 py-2 rounded-lg"
                 style={{ border: "1px solid #2A2A2D", color: refreshingNAV ? "#6E6D67" : "#C9A876", opacity: refreshingNAV ? 0.75 : 1 }}
               >
-                <RefreshCw size={15} className={refreshingNAV ? "animate-spin" : ""} /> {refreshingNAV ? "Refreshing NAVs…" : "Refresh mutual fund NAVs"}
+                <RefreshCw size={15} className={refreshingNAV ? "animate-spin" : ""} /> {refreshingNAV ? "Refreshing prices…" : "Refresh prices"}
               </button>
             </div>
             {navErrors.length > 0 && (
@@ -437,7 +494,8 @@ export default function PortfolioTracker() {
                       <div className="flex items-center gap-4 shrink-0">
                         <div className="text-right">
                           <div className="text-sm pf-mono">{fmt(h.value)}</div>
-                          <div className="text-xs pf-mono" style={{ color: h.pnl >= 0 ? "#8FAF8A" : "#C97B6B" }}>{fmtPct(h.pnlPct)}</div>
+                          <div className="text-xs pf-mono" style={{ color: "#6E6D67" }}>Invested {fmt(h.invested)}</div>
+                          <div className="text-xs pf-mono" style={{ color: h.pnl >= 0 ? "#8FAF8A" : "#C97B6B" }}>{fmt(h.pnl)} ({fmtPct(h.pnlPct)})</div>
                         </div>
                         <button className="pf-delete" onClick={() => deleteHolding(h.id)}><Trash2 size={14} color="#6E6D67" /></button>
                       </div>
@@ -451,36 +509,47 @@ export default function PortfolioTracker() {
               <div className="p-4 rounded-lg flex flex-col gap-3" style={{ background: "#131314", border: "1px solid #1F1F22" }}>
                 <div className="flex flex-wrap gap-3">
                   <Field label="Class">
-                    <select className="pf-input" style={inputStyle} value={hForm.assetClass} onChange={(e) => setHForm({ ...hForm, assetClass: e.target.value })}>
+                    <select className="pf-input" style={inputStyle} value={hForm.assetClass} onChange={(e) => { setHForm({ ...hForm, assetClass: e.target.value, name: "", ticker: "", currentPrice: "" }); setSelectedFund(null); setFundSearchQuery(""); setFundSearchResults([]); }}>
                       {ASSET_CLASSES.map((c) => <option key={c} value={c}>{c}</option>)}
                     </select>
                   </Field>
-                  <Field label="Name">
-                    <input className="pf-input" style={{ ...inputStyle, width: 160 }} value={hForm.name} onChange={(e) => setHForm({ ...hForm, name: e.target.value })} placeholder="HDFC Bank" />
-                  </Field>
-                  <Field label={hForm.assetClass === "Mutual Fund" ? "AMFI scheme code" : "Ticker"}>
-                    <input className="pf-input" style={{ ...inputStyle, width: 130 }} value={hForm.ticker} onChange={(e) => setHForm({ ...hForm, ticker: e.target.value })} placeholder={hForm.assetClass === "Mutual Fund" ? "119551" : "HDFCBANK"} />
-                  </Field>
+                  {hForm.assetClass !== "Mutual Fund" && (
+                    <>
+                      <Field label="Name">
+                        <input className="pf-input" style={{ ...inputStyle, width: 160 }} value={hForm.name} onChange={(e) => setHForm({ ...hForm, name: e.target.value })} placeholder="HDFC Bank" />
+                      </Field>
+                      <Field label="Ticker">
+                        <input className="pf-input" style={{ ...inputStyle, width: 130 }} value={hForm.ticker} onChange={(e) => setHForm({ ...hForm, ticker: e.target.value })} placeholder="HDFCBANK" />
+                      </Field>
+                    </>
+                  )}
                 </div>
                 {hForm.assetClass === "Mutual Fund" && (
                   <div className="rounded-lg p-3" style={{ background: "#101011", border: "1px solid #232326" }}>
-                    <div className="flex flex-wrap gap-2 items-end">
-                      <Field label="Find scheme code by fund name">
-                        <input className="pf-input" style={{ ...inputStyle, width: 260 }} value={fundSearchQuery} onChange={(e) => setFundSearchQuery(e.target.value)} placeholder="Parag Parikh Flexi Cap" />
-                      </Field>
-                      <button onClick={runFundSearch} disabled={searchingFunds || !fundSearchQuery.trim()} className="flex items-center gap-2 text-sm px-3 py-2 rounded-lg" style={{ background: "#232326", color: "#F2F1EC", opacity: searchingFunds ? 0.75 : 1 }}>
-                        <Search size={14} /> {searchingFunds ? "Searching…" : "Search"}
-                      </button>
-                    </div>
-                    {fundSearchNotice && <div className="text-xs mt-2" style={{ color: "#C97B6B" }}>{fundSearchNotice}</div>}
-                    {fundSearchResults.length > 0 && (
-                      <div className="flex flex-col gap-2 mt-3">
-                        {fundSearchResults.map((fund) => (
-                          <button key={fund.schemeCode} onClick={() => setHForm({ ...hForm, ticker: String(fund.schemeCode), name: fund.schemeName })} className="text-left text-xs p-2 rounded-lg" style={{ background: "#161617", color: "#A3A29C", border: "1px solid #2A2A2D" }}>
-                            <span className="pf-mono" style={{ color: "#C9A876" }}>{fund.schemeCode}</span> · {fund.schemeName}
-                          </button>
-                        ))}
+                    {selectedFund ? (
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-xs px-3 py-2 rounded-full" style={{ background: "rgba(201,168,118,0.12)", color: "#C9A876", border: "1px solid rgba(201,168,118,0.22)" }}>
+                          Selected: <span className="pf-mono">{selectedFund.schemeCode}</span> · {selectedFund.schemeName}
+                        </div>
+                        <button onClick={() => { setSelectedFund(null); setHForm({ ...hForm, name: "", ticker: "", currentPrice: "" }); setFundSearchQuery(""); }} className="text-xs" style={{ color: "#C9A876" }}>change</button>
                       </div>
+                    ) : (
+                      <>
+                        <Field label="Search mutual fund">
+                          <input className="pf-input" style={{ ...inputStyle, width: "100%" }} value={fundSearchQuery} onChange={(e) => setFundSearchQuery(e.target.value)} placeholder="Type at least 2 characters, e.g. Parag Parikh Flexi Cap" />
+                        </Field>
+                        {searchingFunds && <div className="text-xs mt-2" style={{ color: "#6E6D67" }}>Searching funds…</div>}
+                        {fundSearchNotice && <div className="text-xs mt-2" style={{ color: "#C97B6B" }}>{fundSearchNotice}</div>}
+                        {fundSearchResults.length > 0 && (
+                          <div className="flex flex-col gap-2 mt-3">
+                            {fundSearchResults.slice(0, 8).map((fund) => (
+                              <button key={fund.schemeCode} onClick={() => selectMutualFund(fund)} className="text-left text-xs p-2 rounded-lg" style={{ background: "#161617", color: "#A3A29C", border: "1px solid #2A2A2D" }}>
+                                <span className="pf-mono" style={{ color: "#C9A876" }}>{fund.schemeCode}</span> · {fund.schemeName}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </>
                     )}
                   </div>
                 )}
@@ -497,7 +566,7 @@ export default function PortfolioTracker() {
                 </div>
                 <div className="flex gap-2 mt-1">
                   <button onClick={submitHolding} className="text-sm px-3 py-2 rounded-lg" style={{ background: "#C9A876", color: "#0B0B0C", fontWeight: 600 }}>Add holding</button>
-                  <button onClick={() => setAddingHolding(false)} className="text-sm px-3 py-2 rounded-lg" style={{ color: "#8C8B86" }}>Cancel</button>
+                  <button onClick={() => { setAddingHolding(false); setSelectedFund(null); setFundSearchQuery(""); setFundSearchResults([]); }} className="text-sm px-3 py-2 rounded-lg" style={{ color: "#8C8B86" }}>Cancel</button>
                 </div>
               </div>
             ) : (
