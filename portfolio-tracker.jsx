@@ -26,6 +26,21 @@ if (typeof window !== "undefined") {
   });
 }
 
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const toMfDate = (isoDate) => {
+  const [year, month, day] = isoDate.split("-");
+  return `${day}-${month}-${year}`;
+};
+const parseMfDate = (date) => {
+  const [day, month, year] = String(date || "").split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day));
+};
+const isTodayOrFuture = (isoDate) => !isoDate || isoDate >= todayISO();
+const roundQuantity = (quantity, assetClass) => {
+  const precision = assetClass === "Equity" ? 2 : 4;
+  return Number(quantity.toFixed(precision));
+};
+
 export async function fetchMutualFundNAV(schemeCode) {
   const cleanCode = String(schemeCode || "").trim();
   if (!cleanCode) throw new Error("missing scheme code");
@@ -43,6 +58,27 @@ export async function fetchMutualFundNAV(schemeCode) {
   return nav;
 }
 
+async function fetchMutualFundHistoricalNAV(schemeCode, isoDate) {
+  if (isTodayOrFuture(isoDate)) return fetchMutualFundNAV(schemeCode);
+
+  const cleanCode = String(schemeCode || "").trim();
+  if (!/^\d{6}$/.test(cleanCode)) throw new Error("invalid scheme code");
+
+  const response = await fetch(`https://api.mfapi.in/mf/${cleanCode}`);
+  if (!response.ok) throw new Error(`NAV history lookup failed (${response.status})`);
+
+  const payload = await response.json();
+  if (payload.status && payload.status !== "SUCCESS") throw new Error("scheme code does not exist");
+
+  const target = parseMfDate(toMfDate(isoDate)).getTime();
+  const entries = Array.isArray(payload?.data) ? payload.data : [];
+  const match = entries.find((entry) => parseMfDate(entry.date).getTime() <= target);
+  const nav = Number.parseFloat(match?.nav);
+  if (Number.isNaN(nav)) throw new Error("historical NAV is missing");
+
+  return nav;
+}
+
 async function searchMutualFunds(query) {
   const cleanQuery = query.trim();
   if (!cleanQuery) return [];
@@ -53,6 +89,91 @@ async function searchMutualFunds(query) {
   const results = await response.json();
   if (!Array.isArray(results)) return [];
   return results.slice(0, 6);
+}
+
+
+async function resolveCryptoId(query) {
+  const cleanQuery = String(query || "").trim();
+  if (!cleanQuery) throw new Error("missing crypto ticker");
+
+  const response = await fetch(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(cleanQuery)}`);
+  if (!response.ok) throw new Error(`crypto search failed (${response.status})`);
+
+  const payload = await response.json();
+  const queryLower = cleanQuery.toLowerCase();
+  const coin = (payload?.coins || []).find((item) => item.symbol?.toLowerCase() === queryLower) || payload?.coins?.[0];
+  if (!coin?.id) throw new Error("crypto asset not found");
+  return coin.id;
+}
+
+async function fetchCryptoLatestPrice(query) {
+  const cgId = await resolveCryptoId(query);
+  const response = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(cgId)}&vs_currencies=inr`);
+  if (!response.ok) throw new Error(`crypto price lookup failed (${response.status})`);
+
+  const payload = await response.json();
+  const price = Number(payload?.[cgId]?.inr);
+  if (!Number.isFinite(price) || price <= 0) throw new Error("crypto price is missing");
+  return { price, cgId };
+}
+
+async function fetchCryptoHistoricalPrice(query, isoDate) {
+  if (isTodayOrFuture(isoDate)) return fetchCryptoLatestPrice(query);
+
+  const cgId = await resolveCryptoId(query);
+  const response = await fetch(`https://api.coingecko.com/api/v3/coins/${encodeURIComponent(cgId)}/history?date=${toMfDate(isoDate)}&localization=false`);
+  if (!response.ok) throw new Error(`crypto history lookup failed (${response.status})`);
+
+  const payload = await response.json();
+  const price = Number(payload?.market_data?.current_price?.inr);
+  if (!Number.isFinite(price) || price <= 0) throw new Error("historical crypto price is missing");
+  return { price, cgId };
+}
+
+const twelveDataKey = () => import.meta.env?.VITE_TWELVE_DATA_API_KEY || import.meta.env?.VITE_TWELVEDATA_API_KEY || "";
+
+async function fetchEquityPrice(ticker, isoDate = todayISO()) {
+  const cleanTicker = String(ticker || "").trim().toUpperCase();
+  const apiKey = twelveDataKey();
+  if (!cleanTicker) throw new Error("missing equity ticker");
+  if (!apiKey) throw new Error("Twelve Data API key is missing");
+
+  const target = new Date(`${isoDate}T00:00:00Z`);
+  const start = new Date(target);
+  start.setUTCDate(start.getUTCDate() - 10);
+  const params = new URLSearchParams({
+    symbol: cleanTicker,
+    interval: "1day",
+    start_date: start.toISOString().slice(0, 10),
+    end_date: isoDate,
+    apikey: apiKey,
+  });
+  const response = await fetch(`https://api.twelvedata.com/time_series?${params.toString()}`);
+  if (!response.ok) throw new Error(`equity price lookup failed (${response.status})`);
+
+  const payload = await response.json();
+  if (payload.status === "error") throw new Error(payload.message || "equity price lookup failed");
+
+  const targetTime = target.getTime();
+  const entry = (payload.values || [])
+    .filter((value) => new Date(`${value.datetime}T00:00:00Z`).getTime() <= targetTime)
+    .sort((a, b) => new Date(`${b.datetime}T00:00:00Z`) - new Date(`${a.datetime}T00:00:00Z`))[0];
+  const price = Number.parseFloat(entry?.close);
+  if (!Number.isFinite(price) || price <= 0) throw new Error("equity close price is missing");
+
+  return price;
+}
+
+async function fetchLatestAssetPrice(assetClass, ticker) {
+  if (assetClass === "Mutual Fund") return fetchMutualFundNAV(ticker);
+  if (assetClass === "Crypto") return (await fetchCryptoLatestPrice(ticker)).price;
+  return fetchEquityPrice(ticker, todayISO());
+}
+
+async function fetchInvestedAssetPrice(assetClass, ticker, isoDate) {
+  if (assetClass === "Mutual Fund") return fetchMutualFundHistoricalNAV(ticker, isoDate);
+  if (assetClass === "Crypto") return (await fetchCryptoHistoricalPrice(ticker, isoDate)).price;
+  return fetchEquityPrice(ticker, isTodayOrFuture(isoDate) ? todayISO() : isoDate);
 }
 
 const ASSET_CLASSES = ["Equity", "Crypto", "Mutual Fund"];
@@ -108,6 +229,8 @@ export default function PortfolioTracker() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [refreshingNAV, setRefreshingNAV] = useState(false);
+  const [lookingUpHoldingPrice, setLookingUpHoldingPrice] = useState(false);
+  const [holdingPriceNote, setHoldingPriceNote] = useState("");
   const refreshPricesRef = useRef(async () => {});
   const [user, setUser] = useState(null);
   const [holdings, setHoldings] = useState([]);
@@ -123,7 +246,7 @@ export default function PortfolioTracker() {
   const [searchingFunds, setSearchingFunds] = useState(false);
   const [selectedFund, setSelectedFund] = useState(null);
 
-  const [hForm, setHForm] = useState({ assetClass: "Equity", name: "", ticker: "", quantity: "", avgPrice: "", currentPrice: "" });
+  const [hForm, setHForm] = useState({ assetClass: "Equity", name: "", ticker: "", amountInvested: "", dateInvested: todayISO(), currentPrice: "" });
   const [jForm, setJForm] = useState({ date: new Date().toISOString().slice(0, 10), instrument: "", direction: "Long", pnl: "", outcome: "WIN", notes: "" });
 
   useEffect(() => {
@@ -219,41 +342,40 @@ export default function PortfolioTracker() {
   const journalPnl = journal.reduce((s, j) => s + Number(j.pnl), 0);
 
   const refreshPrices = async ({ silent = false } = {}) => {
-    const mutualFunds = holdings.filter((holding) => holding.assetClass === "Mutual Fund");
-    if (mutualFunds.length === 0) {
-      if (!silent) setNotice("Add a mutual fund holding to refresh prices.");
+    if (holdings.length === 0) {
+      if (!silent) setNotice("Add a holding to refresh prices.");
       setNavErrors([]);
       return;
     }
 
     setRefreshingNAV(true);
     setNavErrors([]);
-    const results = await Promise.allSettled(mutualFunds.map(async (holding) => {
-      const nav = await fetchMutualFundNAV(holding.ticker);
-      return { id: holding.id, nav };
+    const results = await Promise.allSettled(holdings.map(async (holding) => {
+      const currentPrice = await fetchLatestAssetPrice(holding.assetClass, holding.cgId || holding.ticker);
+      return { id: holding.id, currentPrice };
     }));
 
-    const navById = new Map();
+    const priceById = new Map();
     const errors = [];
     results.forEach((result, index) => {
-      const holding = mutualFunds[index];
+      const holding = holdings[index];
       if (result.status === "fulfilled") {
-        navById.set(result.value.id, result.value.nav);
+        priceById.set(result.value.id, result.value.currentPrice);
       } else {
-        errors.push(`${holding.name}: ${result.reason?.message || "couldn't refresh NAV"}`);
+        errors.push(`${holding.name}: ${result.reason?.message || "couldn't refresh price"}`);
       }
     });
 
-    if (navById.size > 0) {
+    if (priceById.size > 0) {
       const next = holdings.map((holding) => (
-        navById.has(holding.id) ? { ...holding, currentPrice: navById.get(holding.id) } : holding
+        priceById.has(holding.id) ? { ...holding, currentPrice: priceById.get(holding.id) } : holding
       ));
       await savePortfolio(next, journal);
     }
 
     setNavErrors(errors);
     if (!silent || errors.length > 0) {
-      setNotice(`${navById.size} mutual fund NAV${navById.size === 1 ? "" : "s"} refreshed${errors.length ? ` · ${errors.length} issue${errors.length === 1 ? "" : "s"}` : ""}.`);
+      setNotice(`${priceById.size} price${priceById.size === 1 ? "" : "s"} refreshed${errors.length ? ` · ${errors.length} issue${errors.length === 1 ? "" : "s"}` : ""}.`);
     }
     setRefreshingNAV(false);
   };
@@ -323,19 +445,46 @@ export default function PortfolioTracker() {
 
 
 
-  const submitHolding = () => {
-    const qty = parseFloat(hForm.quantity);
-    const avg = parseFloat(hForm.avgPrice);
-    const cur = parseFloat(hForm.currentPrice);
-    if (!hForm.name.trim() || !qty || !avg || !cur) { setNotice("Fill in name, quantity, avg price and current price."); return; }
+  const submitHolding = async () => {
+    const amountInvested = Number.parseFloat(hForm.amountInvested);
     const ticker = hForm.assetClass === "Mutual Fund" ? hForm.ticker.trim() : hForm.ticker.trim().toUpperCase();
-    const next = [...holdings, { id: uid(), assetClass: hForm.assetClass, name: hForm.name.trim(), ticker, quantity: qty, avgPrice: avg, currentPrice: cur }];
-    savePortfolio(next, journal);
-    setHForm({ assetClass: "Equity", name: "", ticker: "", quantity: "", avgPrice: "", currentPrice: "" });
-    setSelectedFund(null);
-    setFundSearchQuery("");
-    setFundSearchResults([]);
-    setAddingHolding(false);
+    const investedDate = hForm.dateInvested || todayISO();
+    if (!hForm.name.trim() || !ticker || !Number.isFinite(amountInvested) || amountInvested <= 0) {
+      setNotice("Fill in asset details and a positive amount invested.");
+      return;
+    }
+
+    setLookingUpHoldingPrice(true);
+    setHoldingPriceNote("");
+    try {
+      let avgPrice;
+      let currentPrice;
+      let usedFallback = false;
+      try {
+        [avgPrice, currentPrice] = await Promise.all([
+          fetchInvestedAssetPrice(hForm.assetClass, ticker, investedDate),
+          fetchLatestAssetPrice(hForm.assetClass, ticker),
+        ]);
+      } catch (e) {
+        currentPrice = await fetchLatestAssetPrice(hForm.assetClass, ticker);
+        avgPrice = currentPrice;
+        usedFallback = true;
+      }
+
+      const quantity = roundQuantity(amountInvested / avgPrice, hForm.assetClass);
+      const next = [...holdings, { id: uid(), assetClass: hForm.assetClass, name: hForm.name.trim(), ticker, quantity, avgPrice, currentPrice }];
+      await savePortfolio(next, journal);
+      if (usedFallback) setNotice("Using today's price — historical data unavailable");
+      setHForm({ assetClass: "Equity", name: "", ticker: "", amountInvested: "", dateInvested: todayISO(), currentPrice: "" });
+      setSelectedFund(null);
+      setFundSearchQuery("");
+      setFundSearchResults([]);
+      setAddingHolding(false);
+    } catch (e) {
+      setHoldingPriceNote(e.message || "Price lookup failed.");
+    } finally {
+      setLookingUpHoldingPrice(false);
+    }
   };
 
   const deleteHolding = (id) => savePortfolio(holdings.filter((h) => h.id !== id), journal);
@@ -509,7 +658,7 @@ export default function PortfolioTracker() {
               <div className="p-4 rounded-lg flex flex-col gap-3" style={{ background: "#131314", border: "1px solid #1F1F22" }}>
                 <div className="flex flex-wrap gap-3">
                   <Field label="Class">
-                    <select className="pf-input" style={inputStyle} value={hForm.assetClass} onChange={(e) => { setHForm({ ...hForm, assetClass: e.target.value, name: "", ticker: "", currentPrice: "" }); setSelectedFund(null); setFundSearchQuery(""); setFundSearchResults([]); }}>
+                    <select className="pf-input" style={inputStyle} value={hForm.assetClass} onChange={(e) => { setHForm({ ...hForm, assetClass: e.target.value, name: "", ticker: "", currentPrice: "" }); setHoldingPriceNote(""); setSelectedFund(null); setFundSearchQuery(""); setFundSearchResults([]); }}>
                       {ASSET_CLASSES.map((c) => <option key={c} value={c}>{c}</option>)}
                     </select>
                   </Field>
@@ -531,7 +680,7 @@ export default function PortfolioTracker() {
                         <div className="text-xs px-3 py-2 rounded-full" style={{ background: "rgba(201,168,118,0.12)", color: "#C9A876", border: "1px solid rgba(201,168,118,0.22)" }}>
                           Selected: <span className="pf-mono">{selectedFund.schemeCode}</span> · {selectedFund.schemeName}
                         </div>
-                        <button onClick={() => { setSelectedFund(null); setHForm({ ...hForm, name: "", ticker: "", currentPrice: "" }); setFundSearchQuery(""); }} className="text-xs" style={{ color: "#C9A876" }}>change</button>
+                        <button onClick={() => { setSelectedFund(null); setHForm({ ...hForm, name: "", ticker: "", currentPrice: "" }); setHoldingPriceNote(""); setFundSearchQuery(""); }} className="text-xs" style={{ color: "#C9A876" }}>change</button>
                       </div>
                     ) : (
                       <>
@@ -554,18 +703,19 @@ export default function PortfolioTracker() {
                   </div>
                 )}
                 <div className="flex flex-wrap gap-3">
-                  <Field label="Quantity">
-                    <input className="pf-input" style={{ ...inputStyle, width: 100 }} type="number" value={hForm.quantity} onChange={(e) => setHForm({ ...hForm, quantity: e.target.value })} />
+                  <Field label="Amount invested ₹">
+                    <input className="pf-input" style={{ ...inputStyle, width: 150 }} type="number" min="0" step="0.01" value={hForm.amountInvested} onChange={(e) => setHForm({ ...hForm, amountInvested: e.target.value })} required />
                   </Field>
-                  <Field label="Avg buy price ₹">
-                    <input className="pf-input" style={{ ...inputStyle, width: 110 }} type="number" value={hForm.avgPrice} onChange={(e) => setHForm({ ...hForm, avgPrice: e.target.value })} />
+                  <Field label="Date invested">
+                    <input className="pf-input" style={{ ...inputStyle, width: 150 }} type="date" value={hForm.dateInvested} onChange={(e) => setHForm({ ...hForm, dateInvested: e.target.value })} />
                   </Field>
                   <Field label="Current price ₹">
-                    <input className="pf-input" style={{ ...inputStyle, width: 110 }} type="number" value={hForm.currentPrice} onChange={(e) => setHForm({ ...hForm, currentPrice: e.target.value })} />
+                    <input className="pf-input" style={{ ...inputStyle, width: 130, color: "#8C8B86" }} type="number" value={hForm.currentPrice} readOnly placeholder="auto" />
                   </Field>
                 </div>
+                {holdingPriceNote && <div className="text-xs" style={{ color: "#C9A876" }}>{holdingPriceNote}</div>}
                 <div className="flex gap-2 mt-1">
-                  <button onClick={submitHolding} className="text-sm px-3 py-2 rounded-lg" style={{ background: "#C9A876", color: "#0B0B0C", fontWeight: 600 }}>Add holding</button>
+                  <button onClick={submitHolding} disabled={lookingUpHoldingPrice} className="text-sm px-3 py-2 rounded-lg" style={{ background: "#C9A876", color: "#0B0B0C", fontWeight: 600, opacity: lookingUpHoldingPrice ? 0.7 : 1 }}>{lookingUpHoldingPrice ? "Looking up price…" : "Add holding"}</button>
                   <button onClick={() => { setAddingHolding(false); setSelectedFund(null); setFundSearchQuery(""); setFundSearchResults([]); }} className="text-sm px-3 py-2 rounded-lg" style={{ color: "#8C8B86" }}>Cancel</button>
                 </div>
               </div>
