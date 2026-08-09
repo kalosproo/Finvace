@@ -6,7 +6,7 @@ import { doc, getFirestore, onSnapshot, serverTimestamp, setDoc } from "firebase
 import { LogIn, LogOut, Plus, RefreshCw, Trash2, TrendingUp, TrendingDown, X } from "lucide-react";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyAwaV8adaZSHfXtgRvYWNlx1DZFgH4ywrk",
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain: "finvace.firebaseapp.com",
   projectId: "finvace",
   storageBucket: "finvace.firebasestorage.app",
